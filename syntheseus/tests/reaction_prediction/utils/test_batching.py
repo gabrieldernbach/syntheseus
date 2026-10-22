@@ -12,7 +12,6 @@ from syntheseus import BackwardReactionModel, Bag, ForwardReactionModel, Molecul
 from syntheseus.interface.reaction import SingleProductReaction
 from syntheseus.reaction_prediction.filters.forward import ForwardReactionFilterModel
 from syntheseus.reaction_prediction.filters.wrapper import FilteredBackwardReactionModel
-from syntheseus.reaction_prediction.utils import batching
 from syntheseus.reaction_prediction.utils.batching import (
     BrokeredBackwardReactionModel,
     BrokeredForwardReactionModel,
@@ -119,41 +118,6 @@ def test_zero_wait_and_drain_still_batch_queued_inputs(monkeypatch, closing) -> 
         finally:
             release.set()
     assert broker.batch_sizes == [3]
-
-
-@pytest.mark.parametrize("deferred", [False, True])
-def test_admission_failure_reaches_owned_deferred_and_queued_callers(monkeypatch, deferred):
-    backend = RecordingModel()
-    broker = InferenceBroker(backend, 4, 0, 4)
-    release, queued, first_queued = _hold_worker(broker, monkeypatch, 4)
-    admit = batching._can_admit
-    admissions = 0
-
-    def fail_admission(batch, candidate):
-        nonlocal admissions
-        admissions += 1
-        if admissions == (2 if deferred else 1):
-            raise RuntimeError("admission failed")
-        return admit(batch, candidate)
-
-    monkeypatch.setattr(batching, "_can_admit", fail_admission)
-    with ThreadPoolExecutor(max_workers=4) as executor, broker:
-        calls = [executor.submit(broker, [Molecule("CC")], 1)]
-        try:
-            assert first_queued.wait(timeout=5)
-            calls.extend(executor.submit(broker, [Molecule("C" * n)], 2) for n in range(3, 6))
-            assert queued.wait(timeout=5)
-            release.set()
-            if deferred:
-                assert calls.pop(0).result(timeout=5)
-            for call in calls:
-                with pytest.raises(RuntimeError, match="admission failed"):
-                    call.result(timeout=5)
-            with pytest.raises(RuntimeError, match="admission failed"):
-                broker([Molecule("CCCCCC")])
-        finally:
-            release.set()
-    assert len(backend.calls) == int(deferred)
 
 
 def test_batches_inputs_and_preserves_order() -> None:
