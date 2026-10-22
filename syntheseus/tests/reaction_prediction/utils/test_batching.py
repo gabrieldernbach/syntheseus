@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import queue
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from typing import Sequence
@@ -11,6 +12,7 @@ from syntheseus import BackwardReactionModel, Bag, ForwardReactionModel, Molecul
 from syntheseus.interface.reaction import SingleProductReaction
 from syntheseus.reaction_prediction.filters.forward import ForwardReactionFilterModel
 from syntheseus.reaction_prediction.filters.wrapper import FilteredBackwardReactionModel
+from syntheseus.reaction_prediction.utils import batching
 from syntheseus.reaction_prediction.utils.batching import (
     BrokeredBackwardReactionModel,
     BrokeredForwardReactionModel,
@@ -47,6 +49,111 @@ class RecordingModel(BackwardReactionModel):
             ]
             for input in inputs
         ]
+
+
+def _hold_worker(broker, monkeypatch, count):
+    release, queued, first_queued = (threading.Event() for _ in range(3))
+    get, put = broker._queue.get, broker._queue.put_nowait
+    accepted = []
+
+    def get_when_released(*args, **kwargs):
+        assert release.wait(timeout=5)
+        return get(*args, **kwargs)
+
+    def put_and_record(ticket):
+        put(ticket)
+        accepted.append(ticket)
+        first_queued.set()
+        if len(accepted) == count:
+            queued.set()
+
+    monkeypatch.setattr(broker._queue, "get", get_when_released)
+    monkeypatch.setattr(broker._queue, "put_nowait", put_and_record)
+    return release, queued, first_queued
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_failed_admission_cancels_queued_inputs(monkeypatch, abort) -> None:
+    release, blocked = threading.Event(), threading.Event()
+    backend = RecordingModel(release=release)
+    broker = InferenceBroker(backend, 1, 0, 1)
+    molecules = [Molecule("C" * length) for length in range(2, 5)]
+    put = broker._queue.put_nowait
+
+    def observe_backpressure(ticket):
+        try:
+            put(ticket)
+        except queue.Full:
+            if ticket.input == molecules[-1]:
+                blocked.set()
+            raise
+
+    monkeypatch.setattr(broker._queue, "put_nowait", observe_backpressure)
+    with ThreadPoolExecutor(max_workers=1) as executor, broker:
+        call = executor.submit(broker, molecules, 1)
+        try:
+            assert backend.started.wait(timeout=5)
+            assert blocked.wait(timeout=5)
+            broker.close(cancel_pending=abort, wait=False)
+            with pytest.raises(RuntimeError, match="not running"):
+                call.result(timeout=5)
+        finally:
+            release.set()
+    assert backend.calls == [(molecules[:1], 1)]
+
+
+@pytest.mark.parametrize("closing", [False, True])
+def test_zero_wait_and_drain_still_batch_queued_inputs(monkeypatch, closing) -> None:
+    backend = RecordingModel()
+    broker = InferenceBroker(backend, 3, 30 if closing else 0, 3)
+    release, queued, _ = _hold_worker(broker, monkeypatch, 3)
+    molecules = [Molecule("C" * length) for length in range(2, 5)]
+    with ThreadPoolExecutor(max_workers=1) as executor, broker:
+        call = executor.submit(broker, molecules, 1)
+        try:
+            assert queued.wait(timeout=5)
+            if closing:
+                broker.close(wait=False)
+            release.set()
+            assert [output[0].product for output in call.result(timeout=5)] == molecules
+        finally:
+            release.set()
+    assert broker.batch_sizes == [3]
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_admission_failure_reaches_owned_deferred_and_queued_callers(monkeypatch, deferred):
+    backend = RecordingModel()
+    broker = InferenceBroker(backend, 4, 0, 4)
+    release, queued, first_queued = _hold_worker(broker, monkeypatch, 4)
+    admit = batching._can_admit
+    admissions = 0
+
+    def fail_admission(batch, candidate):
+        nonlocal admissions
+        admissions += 1
+        if admissions == (2 if deferred else 1):
+            raise RuntimeError("admission failed")
+        return admit(batch, candidate)
+
+    monkeypatch.setattr(batching, "_can_admit", fail_admission)
+    with ThreadPoolExecutor(max_workers=4) as executor, broker:
+        calls = [executor.submit(broker, [Molecule("CC")], 1)]
+        try:
+            assert first_queued.wait(timeout=5)
+            calls.extend(executor.submit(broker, [Molecule("C" * n)], 2) for n in range(3, 6))
+            assert queued.wait(timeout=5)
+            release.set()
+            if deferred:
+                assert calls.pop(0).result(timeout=5)
+            for call in calls:
+                with pytest.raises(RuntimeError, match="admission failed"):
+                    call.result(timeout=5)
+            with pytest.raises(RuntimeError, match="admission failed"):
+                broker([Molecule("CCCCCC")])
+        finally:
+            release.set()
+    assert len(backend.calls) == int(deferred)
 
 
 def test_batches_inputs_and_preserves_order() -> None:
